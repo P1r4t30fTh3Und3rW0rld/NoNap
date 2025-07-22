@@ -2,7 +2,12 @@ use parking_lot::Mutex;
 use rand::Rng;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::{fs, sync::Arc, time::Duration};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{task::JoinHandle, time::sleep};
 use warp::{http::StatusCode, Filter};
 
@@ -23,6 +28,8 @@ struct AppState {
 
 type SharedState = Arc<Mutex<AppState>>;
 
+const LOG_FILE_PATH: &str = "nonap.log";
+
 #[tokio::main]
 async fn main() {
     println!("🚀 NoNap microservice with control API started!");
@@ -35,6 +42,22 @@ async fn main() {
         handles: vec![],
         logs: vec![],
     }));
+
+    // Start pinging immediately on launch
+    {
+        let mut locked = state.lock();
+        locked.running = true;
+
+        let client = Client::new();
+        locked.handles = vec![];
+
+        for target in locked.targets.clone() {
+            let c = client.clone();
+            let s = state.clone();
+            let handle = tokio::spawn(async move { ping_loop(target, c, s).await });
+            locked.handles.push(handle);
+        }
+    }
 
     // Clone state for warp filters
     let with_state = warp::any().map({
@@ -81,7 +104,17 @@ async fn main() {
         .and(with_state.clone())
         .and_then(handle_logs);
 
-    // Combine routes
+    let reload_route = warp::path!("reload")
+        .and(warp::post())
+        .and(with_state.clone())
+        .and_then(handle_reload);
+
+    // Dashboard route (serves static html)
+    let dashboard_route = warp::path::end().and(warp::get()).map(|| {
+        warp::reply::html(DASHBOARD_HTML)
+    });
+
+    // Combine all routes
     let routes = status_route
         .or(start_route)
         .or(stop_route)
@@ -89,6 +122,8 @@ async fn main() {
         .or(add_target_route)
         .or(remove_target_route)
         .or(logs_route)
+        .or(reload_route)
+        .or(dashboard_route)
         .with(warp::log("nonap"));
 
     warp::serve(routes).run(([0, 0, 0, 0], 3030)).await;
@@ -106,7 +141,6 @@ async fn ping_loop(target: PingTarget, client: Client, state: SharedState) {
         {
             let locked = state.lock();
             if !locked.running {
-                // If stopped, break loop
                 break;
             }
         }
@@ -135,16 +169,29 @@ async fn ping_loop(target: PingTarget, client: Client, state: SharedState) {
 }
 
 fn append_log(state: SharedState, message: String) {
-    let mut locked = state.lock();
-    locked.logs.push(message);
-    // Keep logs trimmed to last 100 entries
-    let len = locked.logs.len();
-    if len > 100 {
-        locked.logs.drain(..len - 100);
+    // Add to in-memory logs
+    {
+        let mut locked = state.lock();
+        locked.logs.push(message.clone());
+        let len = locked.logs.len();
+        if len > 100 {
+            locked.logs.drain(..len - 100);
+        }
     }
+
+    // Append to log file (best effort, ignore errors)
+    let _ = std::thread::spawn(move || {
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(LOG_FILE_PATH)
+        {
+            let _ = writeln!(file, "{}", message);
+        }
+    });
 }
 
-// Handlers
+// -- Handlers --
 
 async fn handle_status(state: SharedState) -> Result<impl warp::Reply, warp::Rejection> {
     let locked = state.lock();
@@ -192,8 +239,6 @@ async fn handle_stop(state: SharedState) -> Result<impl warp::Reply, warp::Rejec
     }
 
     locked.running = false;
-
-    // Handles will exit naturally on next loop check
     locked.handles = vec![];
 
     Ok(warp::reply::with_status("Stopped pinging", StatusCode::OK))
@@ -219,7 +264,6 @@ async fn handle_add_target(
 
     locked.targets.push(new_target);
 
-    // If running, restart ping loops to include new target
     if locked.running {
         locked.running = false;
         locked.handles = vec![];
@@ -258,7 +302,6 @@ async fn handle_remove_target(
         ));
     }
 
-    // If running, restart ping loops without removed target
     if locked.running {
         locked.running = false;
         locked.handles = vec![];
@@ -296,3 +339,100 @@ async fn handle_logs(
 
     Ok(warp::reply::json(&logs))
 }
+
+async fn handle_reload(state: SharedState) -> Result<impl warp::Reply, warp::Rejection> {
+    match load_targets_from_file("targets.json") {
+        Ok(new_targets) => {
+            let mut locked = state.lock();
+            locked.targets = new_targets;
+
+            if locked.running {
+                locked.running = false;
+                locked.handles.clear();
+                locked.running = true;
+
+                let client = Client::new();
+                for target in locked.targets.clone() {
+                    let c = client.clone();
+                    let s = state.clone();
+                    locked.handles.push(tokio::spawn(async move {
+                        ping_loop(target, c, s).await
+                    }));
+                }
+            }
+
+            // Build an HTML<String> reply
+            let reply = warp::reply::html("Targets reloaded".to_string());
+            Ok(warp::reply::with_status(reply, StatusCode::OK))
+        }
+        Err(e) => {
+            // Also build an HTML<String> reply
+            let msg = format!("Failed to reload targets: {}", e);
+            let reply = warp::reply::html(msg);
+            Ok(warp::reply::with_status(reply, StatusCode::INTERNAL_SERVER_ERROR))
+        }
+    }
+}
+
+
+
+
+// Dashboard HTML served at /
+const DASHBOARD_HTML: &str = r#"
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='UTF-8' />
+<meta name='viewport' content='width=device-width, initial-scale=1' />
+<title>NoNap Dashboard</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; }
+  h1 { color: #444; }
+  #status { margin-bottom: 20px; }
+  #logs { white-space: pre-wrap; background: #f0f0f0; padding: 10px; height: 300px; overflow-y: scroll; border: 1px solid #ccc; }
+</style>
+</head>
+<body>
+  <h1>NoNap Service Dashboard</h1>
+  <div id="status">Loading status...</div>
+  <h2>Recent Logs</h2>
+  <div id="logs">Loading logs...</div>
+<script>
+  async function fetchStatus() {
+    const res = await fetch('/status');
+    if (!res.ok) {
+      document.getElementById('status').textContent = 'Failed to fetch status';
+      return;
+    }
+    const data = await res.json();
+    let html = `<b>Running:</b> ${data.running}<br/>`;
+    html += `<b>Targets (${data.targets.length}):</b><ul>`;
+    data.targets.forEach(t => {
+      html += `<li>${t.url} (delay: ${t.min_delay}-${t.max_delay} mins)</li>`;
+    });
+    html += '</ul>';
+    html += `<b>Logs count:</b> ${data.logs_count}`;
+    document.getElementById('status').innerHTML = html;
+  }
+
+  async function fetchLogs() {
+    const res = await fetch('/logs?tail=20');
+    if (!res.ok) {
+      document.getElementById('logs').textContent = 'Failed to fetch logs';
+      return;
+    }
+    const logs = await res.json();
+    document.getElementById('logs').textContent = logs.join('\n');
+  }
+
+  async function refresh() {
+    await fetchStatus();
+    await fetchLogs();
+  }
+
+  refresh();
+  setInterval(refresh, 5000); // Refresh every 5 seconds
+</script>
+</body>
+</html>
+"#;

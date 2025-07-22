@@ -1,12 +1,12 @@
 [
     {
       "url": "https://nlp-service-ai-resume-parser.onrender.com/health",
-      "min_delay": 5,
-      "max_delay": 10
+      "min_delay": 1,
+      "max_delay": 2
     },
     {
-      "url": "https://backend-ai-resume-parser.onrender.com/health",
-      "min_delay": 6,
-      "max_delay": 12
+        "url": "https://backend-ai-resume-parser.onrender.com/health",
+        "min_delay": 1,
+        "max_delay": 2
     }
-  ]
+]
