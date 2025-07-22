@@ -5,7 +5,7 @@
       "max_delay": 10
     },
     {
-      "url": "https://your-second-service.com/ping",
+      "url": "https://backend-ai-resume-parser.onrender.com/health",
       "min_delay": 6,
       "max_delay": 12
     }
