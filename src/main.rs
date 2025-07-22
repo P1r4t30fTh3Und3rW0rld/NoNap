@@ -138,8 +138,9 @@ fn append_log(state: SharedState, message: String) {
     let mut locked = state.lock();
     locked.logs.push(message);
     // Keep logs trimmed to last 100 entries
-    if locked.logs.len() > 100 {
-        locked.logs.drain(..locked.logs.len() - 100);
+    let len = locked.logs.len();
+    if len > 100 {
+        locked.logs.drain(..len - 100);
     }
 }
 
